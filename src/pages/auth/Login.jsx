@@ -23,13 +23,20 @@ export default function Login() {
       const userData = snapshot.docs[0].data();
       const uid = snapshot.docs[0].id;
       if (userData.status === 'inactive') throw new Error('บัญชีถูกระงับ');
+      if (userData.status !== 'active') throw new Error('รอ Admin อนุมัติก่อนใช้งาน');
       await signInWithEmailAndPassword(auth, userData.email, password);
       const sessionId = crypto.randomUUID();
       await updateDoc(doc(db, 'users', uid), { currentSession: sessionId });
       login({ uid, ...userData }, sessionId);
       navigate(userData.role === 'staff' ? '/staff/step1' : '/admin');
     } catch (err) {
-      setError('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง');
+      if (err.message === 'บัญชีถูกระงับ') {
+        setError('บัญชีของคุณถูกระงับ กรุณาติดต่อ Admin');
+      } else if (err.message === 'รอ Admin อนุมัติก่อนใช้งาน') {
+        setError('บัญชียังรอการอนุมัติจาก Admin กรุณารอสักครู่');
+      } else {
+        setError('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง');
+      }
     }
     setLoading(false);
   };

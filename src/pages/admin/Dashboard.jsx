@@ -169,7 +169,7 @@ export default function Dashboard() {
       <div>
         <div className="flex items-center gap-3 mb-4">
           <div className="w-1 h-6 bg-green-600 rounded-full"></div>
-          <h2 className="text-xl font-black text-gray-800">📦 พร้อมขายแยกสายพันธุ์</h2>
+          <h2 className="text-xl font-black text-gray-800">📦 พันธุ์ข้าวพร้อมขาย</h2>
           <p className="text-sm text-gray-400">กดดูรายละเอียด</p>
         </div>
 
