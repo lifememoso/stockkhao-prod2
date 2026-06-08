@@ -1,14 +1,15 @@
 import React, { useState, useEffect } from 'react';
-import { collection, query, where, onSnapshot, doc, updateDoc, addDoc, orderBy } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, doc, updateDoc, addDoc, orderBy, getDoc } from 'firebase/firestore';
 import { db } from '../../config/firebase';
 import { useAuthStore } from '../../store/authStore';
-import { updateVarietySummary } from '../../utils/summary';
+import { updateVarietySummary, toSummaryId } from '../../utils/summary';
 
 export default function Approvals() {
   const { user } = useAuthStore();
   const [sales, setSales] = useState([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
+  const [approving, setApproving] = useState(null);
 
   useEffect(() => {
     const q = query(
@@ -24,7 +25,36 @@ export default function Approvals() {
   }, []);
 
   const handleApprove = async (sale) => {
+    if (approving) return;
+    setApproving(sale.id);
+    setMessage('');
+
     try {
+      // ✅ 1. ตรวจสอบว่ายังเป็น pending อยู่ (ป้องกัน approve ซ้ำ)
+      const saleSnap = await getDoc(doc(db, 'sales', sale.id));
+      if (!saleSnap.exists() || saleSnap.data().status !== 'pending') {
+        setMessage({ type: 'error', text: '⚠️ รายการนี้ถูกดำเนินการไปแล้ว' });
+        setApproving(null);
+        return;
+      }
+
+      // ✅ 2. เช็คสต็อกก่อน approve
+      const items = sale.items || [{ riceVariety: sale.riceVariety, bags: sale.totalBags }];
+      for (const item of items) {
+        const summaryRef = doc(db, 'summaryByVariety', toSummaryId(item.riceVariety));
+        const summarySnap = await getDoc(summaryRef);
+        const current = summarySnap.exists() ? summarySnap.data() : { remainingBags: 0 };
+        if (current.remainingBags < item.bags) {
+          setMessage({
+            type: 'error',
+            text: `❌ สต็อก ${item.riceVariety} ไม่พอ! มี ${current.remainingBags} กระสอบ แต่ขาย ${item.bags} กระสอบ`
+          });
+          setApproving(null);
+          return;
+        }
+      }
+
+      // ✅ 3. อนุมัติ
       const now = new Date();
       await updateDoc(doc(db, 'sales', sale.id), {
         status: 'approved',
@@ -33,20 +63,19 @@ export default function Approvals() {
         approvedAt: now,
       });
 
-      // ✅ อัพเดท summary: เพิ่ม soldBags แต่ละพันธุ์
-      const items = sale.items || [{ riceVariety: sale.riceVariety, bags: sale.totalBags }];
+      // ✅ 4. อัพเดท summary ทีละพันธุ์
       for (const item of items) {
         await updateVarietySummary(item.riceVariety, { deltaSoldBags: item.bags });
       }
 
-      // ✅ บันทึก Activity Log
+      // ✅ 5. บันทึก Activity Log
       await addDoc(collection(db, 'activityLog'), {
         action: 'approve_sale',
         saleId: sale.id,
         saleCode: sale.saleId,
         buyerName: sale.buyerName,
         buyerPhone: sale.buyerPhone || '-',
-        items: items,
+        items,
         totalBags: sale.totalBags,
         by: user.uid,
         byName: user.name,
@@ -54,14 +83,29 @@ export default function Approvals() {
       });
 
       setMessage({ type: 'success', text: `✅ อนุมัติ ${sale.saleId} สำเร็จ` });
+
     } catch (err) {
       setMessage({ type: 'error', text: 'เกิดข้อผิดพลาด: ' + err.message });
     }
+
+    setApproving(null);
   };
 
   const handleReject = async (sale) => {
     if (!window.confirm(`ต้องการปฏิเสธ ${sale.saleId} ใช่หรือไม่?`)) return;
+    if (approving) return;
+    setApproving(sale.id);
+    setMessage('');
+
     try {
+      // ตรวจสอบว่ายังเป็น pending อยู่
+      const saleSnap = await getDoc(doc(db, 'sales', sale.id));
+      if (!saleSnap.exists() || saleSnap.data().status !== 'pending') {
+        setMessage({ type: 'error', text: '⚠️ รายการนี้ถูกดำเนินการไปแล้ว' });
+        setApproving(null);
+        return;
+      }
+
       const now = new Date();
       await updateDoc(doc(db, 'sales', sale.id), {
         status: 'rejected',
@@ -70,7 +114,6 @@ export default function Approvals() {
         rejectedAt: now,
       });
 
-      // ✅ บันทึก Activity Log
       await addDoc(collection(db, 'activityLog'), {
         action: 'reject_sale',
         saleId: sale.id,
@@ -82,9 +125,12 @@ export default function Approvals() {
       });
 
       setMessage({ type: 'success', text: `❌ ปฏิเสธ ${sale.saleId} สำเร็จ` });
+
     } catch (err) {
       setMessage({ type: 'error', text: 'เกิดข้อผิดพลาด: ' + err.message });
     }
+
+    setApproving(null);
   };
 
   if (loading) return (
@@ -105,7 +151,11 @@ export default function Approvals() {
       </h2>
 
       {message && (
-        <div className={`p-4 rounded-xl mb-6 ${message.type === 'success' ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'}`}>
+        <div className={`p-4 rounded-xl mb-6 ${
+          message.type === 'success'
+            ? 'bg-green-50 text-green-700 border border-green-200'
+            : 'bg-red-50 text-red-700 border border-red-200'
+        }`}>
           {message.text}
         </div>
       )}
@@ -131,7 +181,8 @@ export default function Approvals() {
                   {sale.buyerPhone && sale.buyerPhone !== '-' && (
                     <p className="text-sm text-gray-600">📱 {sale.buyerPhone}</p>
                   )}
-                  <p className="text-sm text-gray-500 mt-1">บันทึกโดย: {sale.createdByName}</p>
+                  <p className="text-sm text-gray-500 mt-1">📅 {sale.saleDate}</p>
+                  <p className="text-sm text-gray-500">บันทึกโดย: {sale.createdByName}</p>
                 </div>
                 <div className="text-right">
                   <p className="text-3xl font-black text-orange-600">{sale.totalBags}</p>
@@ -163,13 +214,15 @@ export default function Approvals() {
               <div className="grid grid-cols-2 gap-3">
                 <button
                   onClick={() => handleApprove(sale)}
-                  className="bg-gradient-to-r from-green-600 to-green-500 text-white py-3 rounded-lg font-bold hover:shadow-md transition text-sm"
+                  disabled={approving === sale.id}
+                  className="bg-gradient-to-r from-green-600 to-green-500 text-white py-3 rounded-lg font-bold hover:shadow-md transition text-sm disabled:opacity-50"
                 >
-                  ✅ อนุมัติ
+                  {approving === sale.id ? '⏳ กำลังดำเนินการ...' : '✅ อนุมัติ'}
                 </button>
                 <button
                   onClick={() => handleReject(sale)}
-                  className="bg-gradient-to-r from-red-500 to-red-600 text-white py-3 rounded-lg font-bold hover:shadow-md transition text-sm"
+                  disabled={approving === sale.id}
+                  className="bg-gradient-to-r from-red-500 to-red-600 text-white py-3 rounded-lg font-bold hover:shadow-md transition text-sm disabled:opacity-50"
                 >
                   ❌ ปฏิเสธ
                 </button>
