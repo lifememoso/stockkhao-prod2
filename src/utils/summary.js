@@ -25,11 +25,14 @@ export const updateVarietySummary = async (
   const soldBags = Math.max(0, (current.soldBags || 0) + deltaSoldBags);
   const totalTons = Math.max(0, (current.totalTons || 0) + deltaTons);
 
+  // ป้องกัน soldBags เกิน totalBags
+  const safeSoldBags = Math.min(soldBags, totalBags);
+
   await setDoc(ref, {
     variety,
     totalBags,
-    soldBags,
-    remainingBags: totalBags - soldBags,
+    soldBags: safeSoldBags,
+    remainingBags: Math.max(0, totalBags - safeSoldBags),
     totalTons,
     updatedAt: Timestamp.now(),
   });
