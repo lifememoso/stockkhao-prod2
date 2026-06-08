@@ -2,8 +2,6 @@ import React, { useState, useEffect } from 'react';
 import { collection, query, where, getDocs, Timestamp } from 'firebase/firestore';
 import { db } from '../../config/firebase';
 
-const MONTHS_TH = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
-
 export default function Export() {
   const [varieties, setVarieties] = useState([]);
   const [selectedVarieties, setSelectedVarieties] = useState([]);
@@ -24,31 +22,41 @@ export default function Export() {
   }, []);
 
   const fetchVarieties = async () => {
-    const snap = await getDocs(query(collection(db, 'settings'), where('type', '==', 'variety'), where('active', '==', true)));
-    const vars = snap.docs.map(d => d.data().name);
-    setVarieties(vars);
-    setSelectedVarieties(vars);
+    try {
+      const snap = await getDocs(query(collection(db, 'settings'), where('type', '==', 'variety'), where('active', '==', true)));
+      const vars = snap.docs.map(d => d.data().name);
+      setVarieties(vars);
+      setSelectedVarieties(vars);
+    } catch (err) {
+      console.error('fetchVarieties error:', err);
+    }
   };
 
   const getDateRange = () => {
-    if (periodType === 'custom') return { start: startDate, end: endDate };
-    if (periodType === 'month') {
-      const [y, m] = selectedMonth.split('-');
-      const start = `${y}-${m}-01`;
-      const end = new Date(parseInt(y), parseInt(m), 0).toISOString().slice(0, 10);
-      return { start, end };
-    }
-    if (periodType === 'quarter') {
-      const [y, q] = selectedQuarter.split('-Q');
-      const qNum = parseInt(q);
-      const startMonth = (qNum - 1) * 3 + 1;
-      const endMonth = qNum * 3;
-      const start = `${y}-${String(startMonth).padStart(2, '0')}-01`;
-      const end = new Date(parseInt(y), endMonth, 0).toISOString().slice(0, 10);
-      return { start, end };
-    }
-    if (periodType === 'year') {
-      return { start: `${selectedYear}-01-01`, end: `${selectedYear}-12-31` };
+    try {
+      if (periodType === 'custom') return { start: startDate, end: endDate };
+      if (periodType === 'month') {
+        if (!selectedMonth) return { start: '', end: '' };
+        const [y, m] = selectedMonth.split('-');
+        const start = `${y}-${m}-01`;
+        const end = new Date(parseInt(y), parseInt(m), 0).toISOString().slice(0, 10);
+        return { start, end };
+      }
+      if (periodType === 'quarter') {
+        if (!selectedQuarter) return { start: '', end: '' };
+        const [y, q] = selectedQuarter.split('-Q');
+        const qNum = parseInt(q);
+        const startMonth = (qNum - 1) * 3 + 1;
+        const endMonth = qNum * 3;
+        const start = `${y}-${String(startMonth).padStart(2, '0')}-01`;
+        const end = new Date(parseInt(y), endMonth, 0).toISOString().slice(0, 10);
+        return { start, end };
+      }
+      if (periodType === 'year') {
+        return { start: `${selectedYear}-01-01`, end: `${selectedYear}-12-31` };
+      }
+    } catch (err) {
+      console.error('getDateRange error:', err);
     }
     return { start: '', end: '' };
   };
