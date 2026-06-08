@@ -114,7 +114,7 @@ export default function Export() {
     if (exportTypes.length === 0) { alert('กรุณาเลือกรูปแบบ'); return; }
     setLoading(true);
     try {
-      const XLSX = await import('https://cdn.sheetjs.com/xlsx-0.20.1/package/xlsx.mjs');
+      const XLSX = await import(/* @vite-ignore */ 'https://cdn.sheetjs.com/xlsx-0.20.1/package/xlsx.mjs');
       const { lots, sales, claims, processing } = await fetchData(start, end);
       const wb = XLSX.utils.book_new();
       const periodLabel = `${start}_${end}`;
@@ -214,17 +214,33 @@ export default function Export() {
           ))}
         </div>
         {periodType==='month' && <input type="month" value={selectedMonth} onChange={e=>setSelectedMonth(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3 focus:outline-none focus:border-green-500" />}
-        {periodType==='quarter' && <select value={selectedQuarter} onChange={e=>setSelectedQuarter(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3">
-          {getQuarters().map(q=><option key={q.value} value={q.value}>{q.label}</option>)}
-        </select>}
-        {periodType==='year' && <select value={selectedYear} onChange={e=>setSelectedYear(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3">
-          {getYears().map(y=><option key={y} value={y}>ปี {y+543} ({y})</option>)}
-        </select>}
-        {periodType==='custom' && <div className="grid grid-cols-2 gap-3">
-          <div><label className="text-xs text-gray-500 font-bold">วันเริ่มต้น</label><input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3 mt-1" /></div>
-          <div><label className="text-xs text-gray-500 font-bold">วันสิ้นสุด</label><input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3 mt-1" /></div>
-        </div>}
-        {start && end && <div className="mt-3 bg-green-50 rounded-lg p-2 text-xs text-green-700 font-bold text-center">📅 {start} ถึง {end}</div>}
+        {periodType==='quarter' && (
+          <select value={selectedQuarter} onChange={e=>setSelectedQuarter(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3">
+            {getQuarters().map(q=><option key={q.value} value={q.value}>{q.label}</option>)}
+          </select>
+        )}
+        {periodType==='year' && (
+          <select value={selectedYear} onChange={e=>setSelectedYear(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3">
+            {getYears().map(y=><option key={y} value={y}>ปี {y+543} ({y})</option>)}
+          </select>
+        )}
+        {periodType==='custom' && (
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs text-gray-500 font-bold">วันเริ่มต้น</label>
+              <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3 mt-1" />
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 font-bold">วันสิ้นสุด</label>
+              <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)} className="w-full border-2 border-gray-200 rounded-xl p-3 mt-1" />
+            </div>
+          </div>
+        )}
+        {start && end && (
+          <div className="mt-3 bg-green-50 rounded-lg p-2 text-xs text-green-700 font-bold text-center">
+            📅 {start} ถึง {end}
+          </div>
+        )}
       </div>
 
       <div className="bg-white rounded-xl shadow p-5">
