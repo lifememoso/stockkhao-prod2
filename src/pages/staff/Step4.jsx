@@ -1,16 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import {
   collection, addDoc, getDocs, doc, deleteDoc, updateDoc,
-  query, where, Timestamp
+  query, where, Timestamp, runTransaction
 } from 'firebase/firestore';
 import { db } from '../../config/firebase';
 import { useAuthStore } from '../../store/authStore';
+import { toSummaryId, computeSummaryUpdate } from '../../utils/summary';
 
 export default function Step4() {
   const { user } = useAuthStore();
   const [approvedSales, setApprovedSales] = useState([]);
   const [claimReasons, setClaimReasons] = useState([]);
   const [selectedSale, setSelectedSale] = useState(null);
+  const [selectedVariety, setSelectedVariety] = useState(''); // พันธุ์ที่เลือกเคลม (ถ้า sale มีหลายพันธุ์)
   const [formData, setFormData] = useState({ claimBags: '', reason: '', note: '', claimDate: new Date().toISOString().slice(0, 10) });
   const [showAddReason, setShowAddReason] = useState(false);
   const [newReason, setNewReason] = useState('');
@@ -63,30 +65,76 @@ export default function Step4() {
     return ((parseInt(bags) / totalBags) * 100).toFixed(1);
   };
 
+  // คืนรายการ items ของ sale แบบ normalize เสมอ (เผื่อ sale เก่าไม่มี items array)
+  const getSaleItems = (sale) => sale.items || [{ riceVariety: sale.riceVariety, bags: sale.totalBags }];
+
+  // จำนวนกระสอบของพันธุ์ที่เลือกใน sale นี้ (ใช้เป็นเพดานสูงสุดของการเคลม)
+  const getMaxBagsForVariety = (sale, variety) => {
+    const items = getSaleItems(sale);
+    const item = items.find(i => i.riceVariety === variety);
+    return item ? (item.bags || 0) : 0;
+  };
+
+  // เลขใบแท็กของรายการ item ที่ตรงกับพันธุ์ที่เลือกเคลม (ไม่ใช่รวมทุกแท็กของ sale)
+  const getTagCodeForVariety = (sale, variety) => {
+    const items = getSaleItems(sale);
+    const item = items.find(i => i.riceVariety === variety);
+    return item?.tagCode || '-';
+  };
+
+  const handleSelectSale = (sale) => {
+    setSelectedSale(sale);
+    const items = getSaleItems(sale);
+    // ถ้ามีพันธุ์เดียว auto-select ให้เลย ถ้าหลายพันธุ์ต้องให้ผู้ใช้เลือก
+    setSelectedVariety(items.length === 1 ? items[0].riceVariety : '');
+    setFormData({ claimBags: '', reason: '', note: '', claimDate: new Date().toISOString().slice(0, 10) });
+  };
+
+  /**
+   * บันทึกเคลมใหม่ — รวมเป็น transaction เดียว:
+   * - เขียน claim document
+   * - ลด soldBags ของพันธุ์ที่เคลม ใน summaryByVariety (กระสอบที่เคลมกลับมาเป็นพร้อมขายใหม่)
+   */
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!selectedSale || !formData.claimBags || !formData.reason) {
-      setMessage({ type: 'error', text: 'กรุณากรอกข้อมูลให้ครบ' }); return;
+    if (!selectedSale || !selectedVariety || !formData.claimBags || !formData.reason) {
+      setMessage({ type: 'error', text: 'กรุณากรอกข้อมูลให้ครบ (รวมเลือกพันธุ์ที่เคลม)' }); return;
     }
     const claimBags = parseInt(formData.claimBags);
-    if (claimBags <= 0 || claimBags > selectedSale.totalBags) {
-      setMessage({ type: 'error', text: `จำนวนเคลมต้องมากกว่า 0 และไม่เกิน ${selectedSale.totalBags} กระสอบ` }); return;
+    const maxBags = getMaxBagsForVariety(selectedSale, selectedVariety);
+    if (claimBags <= 0 || claimBags > maxBags) {
+      setMessage({ type: 'error', text: `จำนวนเคลมต้องมากกว่า 0 และไม่เกิน ${maxBags} กระสอบ (ของพันธุ์ ${selectedVariety})` }); return;
     }
     setLoading(true);
     try {
       const now = Timestamp.now();
-      const claimPercent = calculateClaimPercent(claimBags, selectedSale.totalBags);
-      const saleVariety = selectedSale.items?.length === 1 ? selectedSale.items[0].riceVariety : selectedSale.riceVariety;
-      await addDoc(collection(db, 'claims'), {
-        saleId: selectedSale.id, saleCode: selectedSale.saleId,
-        riceVariety: saleVariety, buyerName: selectedSale.buyerName,
-        saleBags: selectedSale.totalBags, claimBags,
-        claimPercent: parseFloat(claimPercent), reason: formData.reason,
-        claimDate: formData.claimDate, note: formData.note || '',
-        status: 'recorded', createdBy: user.uid, createdByName: user.name, createdAt: now,
+      const claimPercent = calculateClaimPercent(claimBags, maxBags);
+      const claimDocRef = doc(collection(db, 'claims')); // สร้าง ref ล่วงหน้าเพื่อใช้ใน transaction
+      const summaryRef = doc(db, 'summaryByVariety', toSummaryId(selectedVariety));
+
+      await runTransaction(db, async (transaction) => {
+        // อ่านก่อน
+        const summarySnap = await transaction.get(summaryRef);
+        const currentSummary = summarySnap.exists() ? summarySnap.data() : null;
+
+        // เขียนทีหลัง
+        const updatedSummary = computeSummaryUpdate(selectedVariety, currentSummary, { deltaSoldBags: -claimBags });
+        transaction.set(summaryRef, updatedSummary);
+
+        transaction.set(claimDocRef, {
+          saleId: selectedSale.id, saleCode: selectedSale.saleId,
+          riceVariety: selectedVariety, tagCode: getTagCodeForVariety(selectedSale, selectedVariety),
+          buyerName: selectedSale.buyerName,
+          saleBags: maxBags, claimBags,
+          claimPercent: parseFloat(claimPercent), reason: formData.reason,
+          claimDate: formData.claimDate, note: formData.note || '',
+          status: 'recorded', createdBy: user.uid, createdByName: user.name, createdAt: now,
+        });
       });
-      setMessage({ type: 'success', text: `✅ บันทึกเคลมสำเร็จ! ${claimBags} กระสอบ (${claimPercent}%)` });
+
+      setMessage({ type: 'success', text: `✅ บันทึกเคลมสำเร็จ! ${claimBags} กระสอบ (${claimPercent}%) — ลดยอดขายพันธุ์ ${selectedVariety} แล้ว` });
       setSelectedSale(null);
+      setSelectedVariety('');
       setFormData({ claimBags: '', reason: '', note: '', claimDate: new Date().toISOString().slice(0, 10) });
       fetchClaims();
     } catch (err) {
@@ -95,21 +143,48 @@ export default function Step4() {
     setLoading(false);
   };
 
+  /**
+   * แก้ไขเคลม — แก้ได้แค่จำนวน/สาเหตุ/วันที่/หมายเหตุ พันธุ์คงเดิมเสมอ
+   * ถ้าจำนวนเปลี่ยน ต้องปรับ soldBags ตาม net delta (ของใหม่ - ของเก่า) ในธุรกรรมเดียวกัน
+   */
   const handleEditClaim = async () => {
     if (!editingClaim) return;
     setLoading(true);
     try {
-      const claimPercent = calculateClaimPercent(editForm.claimBags, editingClaim.saleBags);
-      await updateDoc(doc(db, 'claims', editingClaim.id), {
-        claimBags: parseInt(editForm.claimBags),
-        claimPercent: parseFloat(claimPercent),
-        reason: editForm.reason,
-        claimDate: editForm.claimDate,
-        note: editForm.note || '',
-        updatedBy: user.name,
-        updatedAt: Timestamp.now(),
+      const newClaimBags = parseInt(editForm.claimBags);
+      if (newClaimBags <= 0 || newClaimBags > editingClaim.saleBags) {
+        setMessage({ type: 'error', text: `จำนวนเคลมต้องมากกว่า 0 และไม่เกิน ${editingClaim.saleBags} กระสอบ` });
+        setLoading(false);
+        return;
+      }
+      const claimPercent = calculateClaimPercent(newClaimBags, editingClaim.saleBags);
+      // net delta ของ soldBags: ของเก่าคืนกลับมาก่อน (+claimBags เดิม) แล้วหักของใหม่ (-newClaimBags)
+      const deltaSoldBags = (editingClaim.claimBags || 0) - newClaimBags;
+
+      const claimRef = doc(db, 'claims', editingClaim.id);
+      const summaryRef = doc(db, 'summaryByVariety', toSummaryId(editingClaim.riceVariety));
+
+      await runTransaction(db, async (transaction) => {
+        const summarySnap = await transaction.get(summaryRef);
+        const currentSummary = summarySnap.exists() ? summarySnap.data() : null;
+
+        if (deltaSoldBags !== 0) {
+          const updatedSummary = computeSummaryUpdate(editingClaim.riceVariety, currentSummary, { deltaSoldBags });
+          transaction.set(summaryRef, updatedSummary);
+        }
+
+        transaction.update(claimRef, {
+          claimBags: newClaimBags,
+          claimPercent: parseFloat(claimPercent),
+          reason: editForm.reason,
+          claimDate: editForm.claimDate,
+          note: editForm.note || '',
+          updatedBy: user.name,
+          updatedAt: Timestamp.now(),
+        });
       });
-      setMessage({ type: 'success', text: '✅ แก้ไขเคลมสำเร็จ!' });
+
+      setMessage({ type: 'success', text: '✅ แก้ไขเคลมสำเร็จ! (ปรับยอดขายในระบบให้ตรงแล้ว)' });
       setEditingClaim(null);
       fetchClaims();
     } catch (err) {
@@ -118,11 +193,28 @@ export default function Step4() {
     setLoading(false);
   };
 
+  /**
+   * ลบเคลม — รวมเป็น transaction เดียว:
+   * - คืน soldBags กลับเท่ากับจำนวนที่เคยเคลมไป (ยกเลิกเคลม กระสอบกลับไปเป็น "ขายแล้ว" เหมือนเดิม)
+   * - ลบ claim document
+   */
   const handleDeleteClaim = async (claim) => {
     setLoading(true);
     try {
-      await deleteDoc(doc(db, 'claims', claim.id));
-      setMessage({ type: 'success', text: '✅ ลบการเคลมสำเร็จ' });
+      const claimRef = doc(db, 'claims', claim.id);
+      const summaryRef = doc(db, 'summaryByVariety', toSummaryId(claim.riceVariety));
+
+      await runTransaction(db, async (transaction) => {
+        const summarySnap = await transaction.get(summaryRef);
+        const currentSummary = summarySnap.exists() ? summarySnap.data() : null;
+
+        // คืน soldBags กลับ = +claimBags (ยกเลิกการเคลม กระสอบกลับไปเป็น "ขายแล้ว" เหมือนก่อนเคลม)
+        const updatedSummary = computeSummaryUpdate(claim.riceVariety, currentSummary, { deltaSoldBags: claim.claimBags || 0 });
+        transaction.set(summaryRef, updatedSummary);
+        transaction.delete(claimRef);
+      });
+
+      setMessage({ type: 'success', text: '✅ ลบการเคลมสำเร็จ (คืนยอดขายเดิมแล้ว)' });
       fetchClaims();
     } catch (err) {
       setMessage({ type: 'error', text: 'เกิดข้อผิดพลาด: ' + err.message });
@@ -149,7 +241,8 @@ export default function Step4() {
         <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
             <p className="text-xl font-black text-red-600 mb-2">⚠️ ยืนยันการลบ</p>
-            <p className="text-sm text-gray-600 mb-4">ลบการเคลม <b>{confirmDelete.saleCode}</b> — {confirmDelete.claimBags} กระสอบ</p>
+            <p className="text-sm text-gray-600 mb-2">ลบการเคลม <b>{confirmDelete.saleCode}</b> — {confirmDelete.claimBags} กระสอบ</p>
+            <p className="text-xs text-orange-600 bg-orange-50 p-2 rounded-lg mb-3">⚠️ จะคืนยอดขาย (soldBags) ของพันธุ์ {confirmDelete.riceVariety} กลับเท่ากับ {confirmDelete.claimBags} กระสอบ</p>
             <div className="flex gap-3">
               <button onClick={() => handleDeleteClaim(confirmDelete)} disabled={loading}
                 className="flex-1 bg-red-600 text-white py-3 rounded-xl font-bold disabled:opacity-50">
@@ -166,7 +259,8 @@ export default function Step4() {
       {editingClaim && (
         <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
-            <p className="text-lg font-black text-gray-800 mb-4">✏️ แก้ไขเคลม {editingClaim.saleCode}</p>
+            <p className="text-lg font-black text-gray-800 mb-1">✏️ แก้ไขเคลม {editingClaim.saleCode}</p>
+            <p className="text-xs text-blue-600 font-bold mb-4">🌾 พันธุ์: {editingClaim.riceVariety} {editingClaim.tagCode ? `| 🏷️ ${editingClaim.tagCode}` : ''} (แก้พันธุ์ไม่ได้)</p>
             <div className="space-y-3">
               <div>
                 <label className="text-xs font-bold text-gray-500">📦 จำนวนกระสอบที่เคลม (สูงสุด {editingClaim.saleBags})</label>
@@ -213,7 +307,7 @@ export default function Step4() {
           ) : (
             <div className="space-y-3">
               {approvedSales.map(sale => (
-                <button key={sale.id} onClick={() => { setSelectedSale(sale); setFormData({ claimBags: '', reason: '', note: '', claimDate: new Date().toISOString().slice(0, 10) }); }}
+                <button key={sale.id} onClick={() => handleSelectSale(sale)}
                   className="w-full bg-purple-50 border border-purple-300 rounded-xl p-4 text-left hover:shadow-md transition">
                   <div className="flex justify-between items-start">
                     <div className="flex-1">
@@ -222,8 +316,12 @@ export default function Step4() {
                         <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-bold">✅ อนุมัติแล้ว</span>
                       </div>
                       <p className="text-sm font-bold text-gray-700">👤 {sale.buyerName}</p>
-                      {sale.items ? sale.items.map((item, i) => <p key={i} className="text-sm text-gray-600">🌾 {item.riceVariety} — {item.bags} กระสอบ</p>)
-                        : <p className="text-sm text-gray-600">🌾 {sale.riceVariety}</p>}
+                      {sale.items ? sale.items.map((item, i) => (
+                        <p key={i} className="text-sm text-gray-600">
+                          🌾 {item.riceVariety} — {item.bags} กระสอบ
+                          {item.tagCode && <span className="text-blue-600 font-bold ml-1">🏷️ {item.tagCode}</span>}
+                        </p>
+                      )) : <p className="text-sm text-gray-600">🌾 {sale.riceVariety}</p>}
                       {sale.saleDate && <p className="text-sm text-gray-500 mt-1">📅 {sale.saleDate}</p>}
                     </div>
                     <div className="text-right ml-4">
@@ -243,7 +341,7 @@ export default function Step4() {
         <div className="bg-white rounded-xl shadow p-5 mb-6">
           <div className="flex justify-between items-center mb-4">
             <h3 className="font-bold text-gray-800">🔄 บันทึกเคลม</h3>
-            <button onClick={() => setSelectedSale(null)} className="text-gray-400 text-2xl">✕</button>
+            <button onClick={() => { setSelectedSale(null); setSelectedVariety(''); }} className="text-gray-400 text-2xl">✕</button>
           </div>
           <div className="bg-purple-50 rounded-lg p-4 mb-4 border-l-4 border-purple-400">
             <p className="text-sm"><span className="font-bold">รหัสขาย:</span> {selectedSale.saleId}</p>
@@ -251,16 +349,42 @@ export default function Step4() {
             <p className="text-sm font-bold text-purple-600 mt-2">รวม: {selectedSale.totalBags} กระสอบ</p>
           </div>
           <form onSubmit={handleSubmit} className="space-y-4">
+            {/* เลือกพันธุ์ที่จะเคลม — แสดงเฉพาะตอน sale มีหลายพันธุ์ */}
+            {getSaleItems(selectedSale).length > 1 ? (
+              <div>
+                <label className="text-sm text-gray-700 font-bold block mb-1">🌾 เลือกพันธุ์ที่เคลม *</label>
+                <select value={selectedVariety} onChange={e => { setSelectedVariety(e.target.value); setFormData({...formData, claimBags: ''}); }}
+                  className="w-full border-2 border-gray-200 rounded-xl p-3">
+                  <option value="">-- เลือกพันธุ์ --</option>
+                  {getSaleItems(selectedSale).map((item, i) => (
+                    <option key={i} value={item.riceVariety}>
+                      {item.riceVariety} {item.tagCode ? `🏷️${item.tagCode}` : ''} (ขายไป {item.bags} กระสอบ)
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <div className="bg-green-50 rounded-lg p-3 text-sm">
+                <span className="font-bold text-green-700">🌾 พันธุ์ที่เคลม:</span> {selectedVariety}
+                <span className="text-blue-600 font-bold ml-2">🏷️ {getTagCodeForVariety(selectedSale, selectedVariety)}</span>
+              </div>
+            )}
+
             <div>
               <label className="text-sm text-gray-700 font-bold block mb-1">📦 จำนวนกระสอบที่เคลม *</label>
-              <input type="number" value={formData.claimBags} min="1" max={selectedSale.totalBags}
+              <input type="number" value={formData.claimBags} min="1"
+                max={selectedVariety ? getMaxBagsForVariety(selectedSale, selectedVariety) : undefined}
+                disabled={!selectedVariety}
                 onChange={e => setFormData({...formData, claimBags: e.target.value})}
-                className="w-full border-2 border-gray-200 rounded-xl p-3" />
-              {formData.claimBags && (
+                className="w-full border-2 border-gray-200 rounded-xl p-3 disabled:bg-gray-100" />
+              {selectedVariety && (
+                <p className="text-xs text-gray-400 mt-1">เคลมได้สูงสุด {getMaxBagsForVariety(selectedSale, selectedVariety)} กระสอบ (ตามจำนวนที่ขายพันธุ์นี้)</p>
+              )}
+              {formData.claimBags && selectedVariety && (
                 <div className="mt-2 bg-blue-50 rounded-lg p-3">
                   <div className="flex justify-between">
                     <span className="text-sm text-gray-600">ร้อยละเคลม:</span>
-                    <span className="text-lg font-bold text-blue-600">{calculateClaimPercent(formData.claimBags, selectedSale.totalBags)}%</span>
+                    <span className="text-lg font-bold text-blue-600">{calculateClaimPercent(formData.claimBags, getMaxBagsForVariety(selectedSale, selectedVariety))}%</span>
                   </div>
                 </div>
               )}
@@ -295,7 +419,7 @@ export default function Step4() {
               <textarea value={formData.note} onChange={e => setFormData({...formData, note: e.target.value})}
                 rows="2" className="w-full border-2 border-gray-200 rounded-xl p-3" />
             </div>
-            <button type="submit" disabled={loading}
+            <button type="submit" disabled={loading || !selectedVariety}
               className="w-full bg-gradient-to-r from-purple-600 to-purple-500 text-white py-4 rounded-xl font-black text-lg disabled:opacity-50">
               {loading ? '⏳ กำลังบันทึก...' : '✅ บันทึกการเคลม'}
             </button>
@@ -327,6 +451,7 @@ export default function Step4() {
                     </div>
                     <p className="text-sm text-gray-600">👤 {claim.buyerName}</p>
                     <p className="text-sm text-gray-600">🌾 {claim.riceVariety} | 📦 {claim.claimBags} กระสอบ ({claim.claimPercent}%)</p>
+                    {claim.tagCode && <p className="text-sm text-blue-600 font-bold">🏷️ {claim.tagCode}</p>}
                     <p className="text-sm text-gray-600">📋 {claim.reason} | 📅 {claim.claimDate}</p>
                     {claim.note && <p className="text-sm text-gray-500">💬 {claim.note}</p>}
                     <p className="text-xs text-gray-400 mt-1">บันทึกโดย: {claim.createdByName}</p>
