@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import {
   collection, getDocs, query, where, addDoc, updateDoc,
-  deleteDoc, doc, Timestamp, getDoc
+  deleteDoc, doc, Timestamp, getDoc, runTransaction
 } from 'firebase/firestore';
 import { db } from '../../config/firebase';
 import { useAuthStore } from '../../store/authStore';
-import { updateVarietySummary } from '../../utils/summary';
+import { updateVarietySummary, toSummaryId, computeSummaryUpdate } from '../../utils/summary';
 
 export default function Step2() {
   const { user } = useAuthStore();
@@ -138,6 +138,11 @@ export default function Step2() {
     setLoading(false);
   };
 
+  /**
+   * แก้ไขรายการคัดแยก — ถ้าเปลี่ยนพันธุ์ ต้อง rollback พันธุ์เก่า + เพิ่มพันธุ์ใหม่
+   * รวมเป็น transaction เดียวกับการ update document นี้เลย (เหมือนที่ทำใน Step3 handleSubmit)
+   * คำนวณ net delta ต่อพันธุ์ในหน่วยความจำก่อน เผื่อพันธุ์เก่ากับใหม่ซ้ำกัน (กรณีแก้แค่ outputBags)
+   */
   const handleEditProc = async () => {
     if (!editingProc) return;
     setLoading(true);
@@ -146,32 +151,81 @@ export default function Step2() {
       const tagHistory = [...(editingProc.tagHistory || [])];
       const varietyHistory = [...(editingProc.varietyHistory || [])];
       const changes = {};
+      const newOutputBags = parseInt(editForm.outputBags) || editingProc.outputBags;
+      const varietyChanged = editForm.newVariety !== editingProc.newVariety;
+      const bagsChanged = newOutputBags !== editingProc.outputBags;
 
       if (editForm.tagCode !== editingProc.tagCode) {
         changes.tagCode = { from: editingProc.tagCode, to: editForm.tagCode };
         tagHistory.push({ tagCode: editForm.tagCode, oldTagCode: editingProc.tagCode, changedBy: user.name, changedAt: now, note: editForm.editNote || 'แก้ไขใบแท็ก' });
       }
-
-      if (editForm.newVariety !== editingProc.newVariety) {
+      if (varietyChanged) {
         changes.variety = { from: editingProc.newVariety, to: editForm.newVariety };
         varietyHistory.push({ from: editingProc.newVariety, to: editForm.newVariety, changedBy: user.name, changedAt: now });
-        const bags = editingProc.outputBags || 0;
-        await updateVarietySummary(editingProc.newVariety, { deltaBags: -bags, deltaTons: -(editingProc.inputTons || 0) });
-        await updateVarietySummary(editForm.newVariety, { deltaBags: bags, deltaTons: editingProc.inputTons || 0 });
+      }
+      if (bagsChanged) {
+        changes.outputBags = { from: editingProc.outputBags, to: newOutputBags };
       }
 
-      if (parseInt(editForm.outputBags) !== editingProc.outputBags) {
-        changes.outputBags = { from: editingProc.outputBags, to: parseInt(editForm.outputBags) };
-      }
+      const procRef = doc(db, 'processing', editingProc.id);
 
-      await updateDoc(doc(db, 'processing', editingProc.id), {
-        tagCode: editForm.tagCode, newVariety: editForm.newVariety,
-        germinationTestDate: editForm.germinationTestDate, sortingDate: editForm.sortingDate,
-        tagIssueDate: editForm.tagIssueDate,
-        outputBags: parseInt(editForm.outputBags) || editingProc.outputBags,
-        notes: editForm.notes, tagHistory, varietyHistory,
-        updatedBy: user.name, updatedAt: now,
-      });
+      if (varietyChanged || bagsChanged) {
+        // คำนวณ net delta ต่อพันธุ์ในหน่วยความจำก่อน (พันธุ์เก่า/ใหม่ ถ้าซ้ำกันจะหักลบกันเอง)
+        const oldBags = editingProc.outputBags || 0;
+        const oldTons = editingProc.inputTons || 0;
+
+        const deltasByVariety = {}; // summaryId -> { variety, deltaBags, deltaTons }
+        const ensureDelta = (variety) => {
+          const id = toSummaryId(variety);
+          if (!deltasByVariety[id]) deltasByVariety[id] = { variety, deltaBags: 0, deltaTons: 0 };
+          return deltasByVariety[id];
+        };
+
+        // rollback ของเก่าออกจากพันธุ์เดิม
+        ensureDelta(editingProc.newVariety).deltaBags -= oldBags;
+        ensureDelta(editingProc.newVariety).deltaTons -= oldTons;
+        // เพิ่มของใหม่เข้าพันธุ์ใหม่ (inputTons ไม่เปลี่ยนในฟอร์มแก้ไขนี้ ใช้ oldTons เดิมแต่ผูกกับพันธุ์ใหม่)
+        ensureDelta(editForm.newVariety).deltaBags += newOutputBags;
+        ensureDelta(editForm.newVariety).deltaTons += oldTons;
+
+        const summaryRefs = Object.entries(deltasByVariety).map(([id, v]) => ({
+          id, variety: v.variety, deltaBags: v.deltaBags, deltaTons: v.deltaTons, ref: doc(db, 'summaryByVariety', id),
+        }));
+
+        await runTransaction(db, async (transaction) => {
+          // อ่านทั้งหมดก่อน
+          const summarySnaps = {};
+          for (const s of summaryRefs) {
+            const snap = await transaction.get(s.ref);
+            summarySnaps[s.id] = snap.exists() ? snap.data() : null;
+          }
+
+          // เขียนทั้งหมดทีหลัง
+          for (const s of summaryRefs) {
+            const updated = computeSummaryUpdate(s.variety, summarySnaps[s.id], { deltaBags: s.deltaBags, deltaTons: s.deltaTons });
+            transaction.set(s.ref, updated);
+          }
+
+          transaction.update(procRef, {
+            tagCode: editForm.tagCode, newVariety: editForm.newVariety,
+            germinationTestDate: editForm.germinationTestDate, sortingDate: editForm.sortingDate,
+            tagIssueDate: editForm.tagIssueDate,
+            outputBags: newOutputBags,
+            notes: editForm.notes, tagHistory, varietyHistory,
+            updatedBy: user.name, updatedAt: now,
+          });
+        });
+      } else {
+        // ไม่เปลี่ยนพันธุ์และไม่เปลี่ยนจำนวนกระสอบ — ไม่ต้องแตะ summary เลย แก้แค่ document ตรงๆ
+        await updateDoc(procRef, {
+          tagCode: editForm.tagCode, newVariety: editForm.newVariety,
+          germinationTestDate: editForm.germinationTestDate, sortingDate: editForm.sortingDate,
+          tagIssueDate: editForm.tagIssueDate,
+          outputBags: newOutputBags,
+          notes: editForm.notes, tagHistory, varietyHistory,
+          updatedBy: user.name, updatedAt: now,
+        });
+      }
 
       await addDoc(collection(db, 'activityLog'), {
         action: 'edit_processing', lotCode: editingProc.lotCode, round: editingProc.round,
@@ -187,45 +241,131 @@ export default function Step2() {
     setLoading(false);
   };
 
+  /**
+   * ลบการคัดแยก — รวมทุก write เป็น transaction เดียวทั้งหมด:
+   * - rollback summary ของพันธุ์ที่ได้จากการคัดแยกนี้ (totalBags/totalTons)
+   * - คืน tons กลับ lot ต้นทาง
+   * - rollback summary (soldBags) ของทุก sale ที่ approved ซึ่งผูกกับ lot นี้
+   * - ลบ claims ที่ผูกกับ sales เหล่านั้น
+   * - ลบ sales เหล่านั้น
+   * - ลบ processing document นี้
+   *
+   * ถ้าขั้นตอนใดพังกลางทาง (เน็ตหลุด/error) Firestore จะ rollback ทั้งหมดอัตโนมัติ
+   * ไม่มีทางเกิดสภาพ "ลบไปครึ่งหนึ่ง" แบบที่เคยเกิดกับโค้ดเดิม
+   *
+   * ข้อจำกัดของ Firestore transaction: query แบบ where ใช้ในธุรกรรมไม่ได้
+   * จึงต้อง query หา sales/claims ที่เกี่ยวข้อง "ก่อน" เปิด transaction
+   * แล้วเอา doc refs ที่ได้ไปอ่าน-เขียนในธุรกรรมเดียวกันทั้งหมด
+   */
   const handleDeleteProc = async (proc) => {
     setLoading(true);
     try {
-      // rollback summary
-      await updateVarietySummary(proc.newVariety || proc.originalVariety, {
-        deltaBags: -(proc.outputBags || 0),
-        deltaTons: -(proc.inputTons || 0),
-      });
-      // คืน tons กลับ lot
-      const lotRef = doc(db, 'lots', proc.lotId);
-      const lotSnap = await getDoc(lotRef);
-      if (lotSnap.exists()) {
-        const currentTons = lotSnap.data().receivedTons || 0;
-        await updateDoc(lotRef, {
-          receivedTons: parseFloat((currentTons + (proc.inputTons || 0)).toFixed(2)),
-          status: 'open',
-        });
-      }
-      // ลบ sales ที่เกี่ยวกับ lot นี้ (ถ้ามี lotId)
+      // ===== Phase 1: query หา docs ที่เกี่ยวข้องทั้งหมด (นอก transaction) =====
       const salesQ = query(collection(db, 'sales'), where('lotId', '==', proc.lotId));
       const salesSnap = await getDocs(salesQ);
-      for (const s of salesSnap.docs) {
-        const sale = { id: s.id, ...s.data() };
-        if (sale.status === 'approved') {
+      const relatedSales = salesSnap.docs.map(d => ({ id: d.id, ref: d.ref, ...d.data() }));
+
+      // หา claims ของแต่ละ sale ที่เกี่ยวข้อง (รวมเป็น array เดียว)
+      let relatedClaimRefs = [];
+      for (const sale of relatedSales) {
+        const claimsQ = query(collection(db, 'claims'), where('saleId', '==', sale.id));
+        const claimsSnap = await getDocs(claimsQ);
+        relatedClaimRefs.push(...claimsSnap.docs.map(d => d.ref));
+      }
+
+      // เตรียม ref ของ summary doc ทุกพันธุ์ที่จะถูกแก้ (dedupe ด้วย summaryId)
+      // 1) พันธุ์ของ proc เอง (สำหรับ rollback totalBags/totalTons)
+      // 2) พันธุ์ของแต่ละ item ใน sale ที่ approved (สำหรับ rollback soldBags)
+      const summaryIdsNeeded = new Map(); // summaryId -> variety name
+      const procVariety = proc.newVariety || proc.originalVariety;
+      if (procVariety) summaryIdsNeeded.set(toSummaryId(procVariety), procVariety);
+
+      for (const sale of relatedSales) {
+        if (sale.status !== 'approved') continue;
+        const items = sale.items || [{ riceVariety: sale.riceVariety, bags: sale.totalBags }];
+        for (const item of items) {
+          if (item.riceVariety) summaryIdsNeeded.set(toSummaryId(item.riceVariety), item.riceVariety);
+        }
+      }
+      const summaryRefs = Array.from(summaryIdsNeeded.entries()).map(([id, variety]) => ({
+        id, variety, ref: doc(db, 'summaryByVariety', id),
+      }));
+
+      const lotRef = doc(db, 'lots', proc.lotId);
+      const procRef = doc(db, 'processing', proc.id);
+
+      // ===== Phase 2: transaction เดียว อ่านทั้งหมดก่อน คำนวณ แล้วเขียนทั้งหมด =====
+      await runTransaction(db, async (transaction) => {
+        // --- อ่านทั้งหมดก่อน ---
+        const lotSnap = await transaction.get(lotRef);
+        const summarySnaps = {};
+        for (const s of summaryRefs) {
+          const snap = await transaction.get(s.ref);
+          summarySnaps[s.id] = snap.exists() ? snap.data() : null;
+        }
+
+        // --- คำนวณ delta สะสมต่อพันธุ์ (เผื่อหลาย sale ใช้พันธุ์เดียวกัน) ---
+        // เริ่มจาก rollback ผลคัดแยกของ proc นี้ก่อน
+        const deltasByVariety = {}; // summaryId -> { deltaBags, deltaSoldBags, deltaTons }
+        const ensureDelta = (id) => {
+          if (!deltasByVariety[id]) deltasByVariety[id] = { deltaBags: 0, deltaSoldBags: 0, deltaTons: 0 };
+          return deltasByVariety[id];
+        };
+
+        if (procVariety) {
+          const id = toSummaryId(procVariety);
+          const d = ensureDelta(id);
+          d.deltaBags -= (proc.outputBags || 0);
+          d.deltaTons -= (proc.inputTons || 0);
+        }
+
+        for (const sale of relatedSales) {
+          if (sale.status !== 'approved') continue;
           const items = sale.items || [{ riceVariety: sale.riceVariety, bags: sale.totalBags }];
           for (const item of items) {
-            await updateVarietySummary(item.riceVariety, { deltaSoldBags: -(item.bags || 0) });
+            if (!item.riceVariety) continue;
+            const id = toSummaryId(item.riceVariety);
+            const d = ensureDelta(id);
+            d.deltaSoldBags -= (item.bags || 0);
           }
         }
-        const claimsQ = query(collection(db, 'claims'), where('saleId', '==', s.id));
-        const claimsSnap = await getDocs(claimsQ);
-        for (const c of claimsSnap.docs) await deleteDoc(doc(db, 'claims', c.id));
-        await deleteDoc(doc(db, 'sales', s.id));
-      }
-      await deleteDoc(doc(db, 'processing', proc.id));
+
+        // --- เขียน summary ใหม่ทุกพันธุ์ที่เกี่ยวข้อง ---
+        for (const s of summaryRefs) {
+          const delta = deltasByVariety[s.id] || { deltaBags: 0, deltaSoldBags: 0, deltaTons: 0 };
+          const updated = computeSummaryUpdate(s.variety, summarySnaps[s.id], delta);
+          transaction.set(s.ref, updated);
+        }
+
+        // --- คืน tons กลับ lot ---
+        if (lotSnap.exists()) {
+          const currentTons = lotSnap.data().receivedTons || 0;
+          transaction.update(lotRef, {
+            receivedTons: parseFloat((currentTons + (proc.inputTons || 0)).toFixed(2)),
+            status: 'open',
+          });
+        }
+
+        // --- ลบ claims ทั้งหมดที่เกี่ยวข้อง ---
+        for (const ref of relatedClaimRefs) {
+          transaction.delete(ref);
+        }
+
+        // --- ลบ sales ทั้งหมดที่เกี่ยวข้อง ---
+        for (const sale of relatedSales) {
+          transaction.delete(sale.ref);
+        }
+
+        // --- ลบ processing document นี้ ---
+        transaction.delete(procRef);
+      });
+
+      // activityLog เป็น log เสริม ไม่กระทบความถูกต้องของ stock เขียนแยกนอก transaction ได้
       await addDoc(collection(db, 'activityLog'), {
         action: 'delete_processing', lotCode: proc.lotCode, tagCode: proc.tagCode,
-        note: 'ลบโดย Admin (cascade)', by: user.uid, byName: user.name, at: new Date(),
+        note: 'ลบโดย Admin (cascade, transaction)', by: user.uid, byName: user.name, at: new Date(),
       });
+
       setMessage({ type: 'success', text: `✅ ลบการคัดแยก ${proc.tagCode} สำเร็จ` });
       fetchLots();
       fetchProcessing();
@@ -259,6 +399,7 @@ export default function Step2() {
               <p>→ rollback totalBags/totalTons ใน summary</p>
               <p>→ คืน tons กลับ Lot</p>
               <p>→ ลบ sales + claims ที่เกี่ยวข้อง</p>
+              <p>→ ทำเป็นธุรกรรมเดียว (ถ้าพังกลางทางจะไม่มีอะไรถูกลบเลย)</p>
             </div>
             <div className="flex gap-3">
               <button onClick={() => handleDeleteProc(confirmDelete)} disabled={loading}
