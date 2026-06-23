@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { collection, getDocs, query, where } from 'firebase/firestore';
+import { collection, getDocs } from 'firebase/firestore';
 import { db } from '../../config/firebase';
 
 export default function Inventory() {
@@ -7,36 +7,21 @@ export default function Inventory() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // ดึงจาก summaryByVariety ตรงๆ — เป็นแหล่งข้อมูลเดียวกับหน้า Admin Dashboard
+    // ตัวเลขในนี้ถูกอัปเดตผ่าน transaction ทุกครั้งที่มีการคัดแยก/ขาย/เคลม
+    // (ไม่คำนวณ raw data จาก processing+sales เองใหม่ เพราะจะไม่หักเคลมและไม่รองรับ sale หลายพันธุ์)
     const fetchInventory = async () => {
       try {
-        const procSnap = await getDocs(collection(db, 'processing'));
-        const processing = procSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-        const salesSnap = await getDocs(
-          query(collection(db, 'sales'), where('status', '==', 'approved'))
-        );
-        const sales = salesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-        const varietyMap = {};
-
-        processing.forEach(proc => {
-          const variety = proc.newVariety || proc.originalVariety;
-          if (!varietyMap[variety]) {
-            varietyMap[variety] = { variety, totalBags: 0, soldBags: 0 };
-          }
-          varietyMap[variety].totalBags += proc.outputBags || 0;
-        });
-
-        sales.forEach(sale => {
-          if (varietyMap[sale.riceVariety]) {
-            varietyMap[sale.riceVariety].soldBags += sale.totalBags || 0;
-          }
-        });
-
-        const result = Object.values(varietyMap).map(v => ({
-          ...v,
-          remainingBags: v.totalBags - v.soldBags,
-        }));
+        const snap = await getDocs(collection(db, 'summaryByVariety'));
+        const result = snap.docs
+          .map(d => ({ id: d.id, ...d.data() }))
+          .map(v => ({
+            variety: v.variety,
+            totalBags: v.totalBags || 0,
+            soldBags: v.soldBags || 0,
+            remainingBags: v.remainingBags ?? Math.max(0, (v.totalBags || 0) - (v.soldBags || 0)),
+          }))
+          .sort((a, b) => b.remainingBags - a.remainingBags);
 
         setInventory(result);
       } catch (error) {
@@ -65,7 +50,7 @@ export default function Inventory() {
       {/* ยอดรวม */}
       <div className="bg-gradient-to-r from-blue-600 to-blue-500 rounded-2xl p-5 mb-6 text-white text-center">
         <p className="text-blue-100 text-sm mb-1">พร้อมขายทั้งหมด</p>
-        <p className="text-5xl font-black">{totalRemaining}</p>
+        <p className="text-5xl font-black">{totalRemaining.toLocaleString()}</p>
         <p className="text-blue-100 text-sm">กระสอบ</p>
       </div>
 
@@ -77,7 +62,7 @@ export default function Inventory() {
       ) : (
         <div className="space-y-3">
           {inventory.map((item, i) => {
-            const status = item.remainingBags === 0 ? 'red'
+            const status = item.remainingBags <= 0 ? 'red'
               : item.remainingBags < 50 ? 'yellow' : 'green';
             return (
               <div key={i} className="bg-white rounded-2xl shadow p-5">
@@ -97,7 +82,7 @@ export default function Inventory() {
                     <p className={`text-4xl font-black ${
                       status === 'green' ? 'text-green-600' :
                       status === 'yellow' ? 'text-yellow-600' : 'text-red-600'
-                    }`}>{item.remainingBags}</p>
+                    }`}>{item.remainingBags.toLocaleString()}</p>
                     <p className="text-xs text-gray-400">กระสอบ</p>
                   </div>
                 </div>
@@ -109,8 +94,14 @@ export default function Inventory() {
                       status === 'green' ? 'bg-green-500' :
                       status === 'yellow' ? 'bg-yellow-500' : 'bg-red-500'
                     }`}
-                    style={{ width: `${item.totalBags > 0 ? (item.remainingBags / item.totalBags * 100) : 0}%` }}
+                    style={{ width: `${item.totalBags > 0 ? Math.min(100, Math.max(0, item.remainingBags / item.totalBags * 100)) : 0}%` }}
                   />
+                </div>
+
+                {/* รายละเอียดทั้งหมด/ขายแล้ว */}
+                <div className="flex justify-between text-xs text-gray-400 mt-2">
+                  <span>ทั้งหมด: <b className="text-gray-600">{item.totalBags.toLocaleString()}</b> กระสอบ</span>
+                  <span>ขายแล้ว: <b className="text-gray-600">{item.soldBags.toLocaleString()}</b> กระสอบ</span>
                 </div>
               </div>
             );
